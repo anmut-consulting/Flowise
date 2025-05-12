@@ -165,6 +165,15 @@ class GoogleGenerativeAI_ChatModels implements INode {
                 additionalParams: true
             },
             {
+                label: 'Use Search Grounding',
+                name: 'useSearchGrounding',
+                type: 'boolean',
+                description: 'When enabled, the model will use Google search to ground the response.',
+                default: false,
+                optional: true,
+                additionalParams: true
+            },
+            {
                 label: 'Base URL',
                 name: 'baseUrl',
                 type: 'string',
@@ -207,6 +216,7 @@ class GoogleGenerativeAI_ChatModels implements INode {
         const contextCache = nodeData.inputs?.contextCache as FlowiseGoogleAICacheManager
         const streaming = nodeData.inputs?.streaming as boolean
         const baseUrl = nodeData.inputs?.baseUrl as string | undefined
+        const useSearchGrounding = nodeData.inputs?.useSearchGrounding as boolean
 
         const allowImageUploads = nodeData.inputs?.allowImageUploads as boolean
 
@@ -222,6 +232,7 @@ class GoogleGenerativeAI_ChatModels implements INode {
         if (cache) obj.cache = cache
         if (temperature) obj.temperature = parseFloat(temperature)
         if (baseUrl) obj.baseUrl = baseUrl
+        if (useSearchGrounding !== undefined) obj.useSearchGrounding = useSearchGrounding
 
         // Safety Settings
         let harmCategories: string[] = convertMultiOptionsToStringArray(harmCategory)

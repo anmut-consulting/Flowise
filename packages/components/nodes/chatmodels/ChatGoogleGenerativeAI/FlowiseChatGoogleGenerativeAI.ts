@@ -4,6 +4,8 @@ import { BaseChatModel, type BaseChatModelParams } from '@langchain/core/languag
 import { ChatGeneration, ChatGenerationChunk, ChatResult } from '@langchain/core/outputs'
 import { ToolCallChunk } from '@langchain/core/messages/tool'
 import { NewTokenIndices } from '@langchain/core/callbacks/base'
+
+// Import from Google Generative AI
 import {
     EnhancedGenerateContentResponse,
     Content,
@@ -59,6 +61,7 @@ export interface GoogleGenerativeAIChatInput extends BaseChatModelParams, Pick<G
     apiVersion?: string
     baseUrl?: string
     streaming?: boolean
+    useSearchGrounding?: boolean
 }
 
 class LangchainChatGoogleGenerativeAI
@@ -86,6 +89,9 @@ class LangchainChatGoogleGenerativeAI
     streaming = false
 
     streamUsage = true
+    
+    // Whether to use Google Search Grounding
+    useSearchGrounding = false
 
     private client: GenerativeModel
 
@@ -125,6 +131,9 @@ class LangchainChatGoogleGenerativeAI
             throw new Error('`topK` must be a positive integer')
         }
 
+        // Set search grounding if provided, otherwise use default (false)
+        this.useSearchGrounding = fields?.useSearchGrounding ?? false
+
         this.stopSequences = fields?.stopSequences ?? this.stopSequences
 
         this.apiKey = fields?.apiKey ?? process.env['GOOGLE_API_KEY']
@@ -153,31 +162,44 @@ class LangchainChatGoogleGenerativeAI
     }
 
     async getClient(prompt?: Content[], tools?: Tool[]) {
-        this.client = new GenerativeAI(this.apiKey ?? '').getGenerativeModel(
-            {
-                model: this.modelName,
-                tools,
-                safetySettings: this.safetySettings as SafetySetting[],
-                generationConfig: {
-                    candidateCount: 1,
-                    stopSequences: this.stopSequences,
-                    maxOutputTokens: this.maxOutputTokens,
-                    temperature: this.temperature,
-                    topP: this.topP,
-                    topK: this.topK
-                }
-            },
-            {
-                baseUrl: this.baseUrl
+        // Prepare tools based on configuration and input
+        let modelTools = tools ? [...tools] : [];
+        
+        // Add Google Search tool if enabled
+        if (this.useSearchGrounding) {
+            // Create search grounding tool using the simple google_search field
+            // as suggested by the Google API error message
+            modelTools.push({
+                google_search: {}
+            } as Tool);
+        }
+        
+        // Initialize the Google API client with all configuration
+        this.client = new GenerativeAI(this.apiKey ?? '').getGenerativeModel({
+            model: this.modelName,
+            tools: modelTools.length > 0 ? modelTools : undefined,
+            safetySettings: this.safetySettings,
+            generationConfig: {
+                candidateCount: 1,
+                stopSequences: this.stopSequences,
+                maxOutputTokens: this.maxOutputTokens,
+                temperature: this.temperature,
+                topP: this.topP,
+                topK: this.topK
             }
-        )
+        });
+        
+        // Handle context cache for the Google API client
         if (this.contextCache) {
             const cachedContent = await this.contextCache.lookup({
                 contents: prompt ? [{ ...prompt[0], parts: prompt[0].parts.slice(0, 1) }] : [],
                 model: this.modelName,
                 tools
-            })
-            this.client.cachedContent = cachedContent as any
+            });
+            // Apply cached content to the client if applicable
+            if (cachedContent) {
+                this.client.cachedContent = cachedContent;
+            }
         }
     }
 
@@ -190,22 +212,142 @@ class LangchainChatGoogleGenerativeAI
     }
 
     override bindTools(tools: (StructuredToolInterface | Record<string, unknown>)[], kwargs?: Partial<ICommonObject>) {
-        //@ts-ignore
-        return this.bind({ tools: convertToGeminiTools(tools), ...kwargs })
+        // Process the tools and create a new client with them
+        let toolsArray = [];
+        
+        // Process tools for compatibility with the Google API
+        if (Array.isArray(tools)) {
+            // Convert structured tools to Gemini tools format
+            if (!tools.some((t: any) => !('lc_namespace' in t))) {
+                toolsArray.push(...convertToGeminiTools(tools as StructuredToolInterface[]));
+            } else {
+                // Tools are already in the correct format
+                toolsArray.push(...tools as any[]);
+            }
+        }
+        
+        // Initialize the client with the processed tools
+        this.getClient(undefined, toolsArray as Tool[]);
+        
+        // Return this for method chaining
+        return this;
     }
 
     invocationParams(options?: this['ParsedCallOptions']): Omit<GenerateContentRequest, 'contents'> {
         const tools = options?.tools as GoogleGenerativeAIFunctionDeclarationsTool[] | StructuredToolInterface[] | undefined
+        let toolsArray = [];
+        
+        // Add standard tool conversions if needed
         if (Array.isArray(tools) && !tools.some((t: any) => !('lc_namespace' in t))) {
-            return {
-                tools: convertToGeminiTools(options?.tools as StructuredToolInterface[]) as any
-            }
+            toolsArray.push(...convertToGeminiTools(tools as StructuredToolInterface[]));
+        } else if (tools) {
+            toolsArray.push(...tools);
         }
+        
+        // Add Google Search tool if enabled
+        if (this.useSearchGrounding) {
+            toolsArray.push({
+                google_search: {}
+            } as any);
+        }
+        
         return {
-            tools: options?.tools as GoogleGenerativeAIFunctionDeclarationsTool[] | undefined
+            tools: toolsArray.length > 0 ? toolsArray as any : undefined
         }
     }
-
+    
+    /**
+     * This method recreates the model with any tools that need to be added
+     * @param options The parsed call options with any tools to add
+     * @returns The model instance with the appropriate tools
+     */
+    _prepareForCall(options?: this['ParsedCallOptions']) {
+        // Process tools from the options
+        const tools = options?.tools as StructuredToolInterface[] | undefined;
+        
+        // If we have tools or search grounding is enabled, create a new client
+        if ((tools && tools.length > 0) || this.useSearchGrounding) {
+            let toolsArray: any[] = [];
+            
+            // Add tools from the options if they exist
+            if (tools && tools.length > 0) {
+                if (!tools.some((t: any) => !('lc_namespace' in t))) {
+                    // Convert structured tools to Gemini tools
+                    toolsArray.push(...convertToGeminiTools(tools));
+                } else {
+                    // Tools are already in the correct format
+                    toolsArray.push(...tools as any[]);
+                }
+            }
+            
+            // Initialize a new client with the tools and search grounding if needed
+            this.getClient(undefined, toolsArray as Tool[]);
+        }
+        
+        // Return this for method chaining
+        return this;
+    }
+    
+    /**
+     * Handles the actual call to the client with proper formatting
+     * @param messages The messages to send
+     * @param options Call options
+     * @returns The response from the client
+     */
+    async _handleCall(messages: BaseMessage[], options?: this['ParsedCallOptions']) {
+        try {
+            // Convert the messages to Google API format
+            const contents: Content[] = [];
+            
+            for (const message of messages) {
+                if (isBaseMessage(message)) {
+                    const role = message._getType() === 'human' ? 'user' : 
+                                message._getType() === 'ai' ? 'model' : 
+                                message._getType() === 'system' ? 'model' : 'user';
+                    
+                    // Convert text content to Google API format
+                    contents.push({
+                        role,
+                        parts: [{ text: message.content as string }]
+                    });
+                }
+            }
+            
+            // Create the request
+            const request: GenerateContentRequest = { contents };
+            
+            // Add tools including Google Search if enabled
+            if (this.useSearchGrounding) {
+                if (!request.tools) {
+                    request.tools = [];
+                }
+                
+                // Add Google Search tool - use google_search as per the API error message
+                request.tools.push({
+                    google_search: {}
+                } as Tool);
+            }
+            
+            // Use the Google API client
+            const result = await this.client.generateContent(request);
+            
+            // Convert response to the expected format
+            const text = result.response.text();
+            return {
+                generations: [{
+                    text,
+                    message: new AIMessage(text)
+                }]
+            };
+        } catch (error) {
+            console.error('Error in _handleCall:', error);
+            throw error;
+        }
+    }
+    
+    /**
+     * Process function response format for Google API
+     */
     convertFunctionResponse(prompts: Content[]) {
         for (let i = 0; i < prompts.length; i += 1) {
             if (prompts[i].role === 'function') {
@@ -227,55 +369,77 @@ class LangchainChatGoogleGenerativeAI
         }
     }
 
+    /**
+     * Set the context cache manager
+     */
     setContextCache(contextCache: FlowiseGoogleAICacheManager): void {
         this.contextCache = contextCache
     }
 
+    /**
+     * Count tokens in the prompt
+     */
     async getNumTokens(prompt: BaseMessage[]) {
         const contents = convertBaseMessagesToContent(prompt, this._isMultimodalModel)
         const { totalTokens } = await this.client.countTokens({ contents })
         return totalTokens
     }
 
+    /**
+     * Non-streaming implementation
+     */
     async _generateNonStreaming(
         prompt: Content[],
         options: this['ParsedCallOptions'],
         _runManager?: CallbackManagerForLLMRun
     ): Promise<ChatResult> {
-        //@ts-ignore
-        const tools = options.tools ?? []
+        const tools = options?.tools ?? []
 
+        // Process any function responses to the correct format
         this.convertFunctionResponse(prompt)
 
-        if (tools.length > 0) {
-            await this.getClient(prompt, tools as Tool[])
-        } else {
-            await this.getClient(prompt)
-        }
+        // Make sure we have a client with the right tools and configuration
+        await this.getClient(prompt, tools as Tool[])
+
+        // Generate content with the Google API directly
         const res = await this.caller.callWithOptions({ signal: options?.signal }, async () => {
-            let output
             try {
-                output = await this.client.generateContent({
-                    contents: prompt
-                })
+                // Create the request, including search grounding if enabled
+                const request: GenerateContentRequest = { contents: prompt }
+                
+                // Add tools if needed
+                if (tools.length > 0 || this.useSearchGrounding) {
+                    const invocationParams = this.invocationParams(options)
+                    Object.assign(request, invocationParams)
+                }
+                
+                const output = await this.client.generateContent(request)
+                return output
             } catch (e: any) {
+                // Enhance error information
                 if (e.message?.includes('400 Bad Request')) {
                     e.status = 400
                 }
                 throw e
             }
-            return output
         })
+
+        // Convert response to ChatResult format
         const generationResult = mapGenerateContentResultToChatResult(res.response)
-        await _runManager?.handleLLMNewToken(generationResult.generations?.length ? generationResult.generations[0].text : '')
+        
+        // Handle token tracking
+        await _runManager?.handleLLMNewToken(
+            generationResult.generations?.length ? generationResult.generations[0].text : ''
+        )
+        
         return generationResult
     }
 
-    async _generate(
-        messages: BaseMessage[],
-        options: this['ParsedCallOptions'],
-        runManager?: CallbackManagerForLLMRun
-    ): Promise<ChatResult> {
+    /**
+     * Override the _generate method to use our implementation
+     */
+    async _generate(messages: BaseMessage[], options: this['ParsedCallOptions'], runManager?: CallbackManagerForLLMRun): Promise<ChatResult> {
+        // Process messages into Google API format
         let prompt = convertBaseMessagesToContent(messages, this._isMultimodalModel)
         prompt = checkIfEmptyContentAndSameRole(prompt)
 
@@ -299,6 +463,8 @@ class LangchainChatGoogleGenerativeAI
 
             return { generations, llmOutput: { estimatedTokenUsage: tokenUsage } }
         }
+        
+        // Handle non-streaming case
         return this._generateNonStreaming(prompt, options, runManager)
     }
 
